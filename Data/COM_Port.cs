@@ -6,13 +6,12 @@ using System.Threading.Tasks;
 
 namespace PMBusInterface.Data
 {
-    class COM_Port
+    public class COM_Port
     {
-        public string Name { get; set; } = "";
+        public string Name { get; set; }
+        public string Description { get; set; }
 
-        public override string ToString()
-        {
-            return Name;
-        }
+        public override string ToString() => Name;
+       
     }
 }
