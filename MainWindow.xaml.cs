@@ -1,12 +1,17 @@
 ﻿using Microsoft.Win32;
 using PMBusInterface.Data;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Packaging;
 using System.IO.Ports;
 using System.Linq;
+using System.Linq;
 using System.Management;
 using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
@@ -25,24 +30,16 @@ namespace PMBusInterface
     /// </summary>
     public partial class MainWindow : Window
     {
-        public string AvalailablePorts { get; private set; }
+        private enum ReportType { None, PSU, FRU, Scan }
+        private ReportType currentReportType = ReportType.None;
+        private readonly StringBuilder currentReportBuffer = new StringBuilder();
+        private DispatcherTimer _scanTimer;
+        private readonly StringBuilder _receiveBuffer = new StringBuilder();
+        private readonly object _bufferLock = new object();
+        private readonly ManualResetEventSlim _dataReceivedEvent = new ManualResetEventSlim(false);
 
-        public string ScanString { get; private set; }
-
-        public string PSUString { get; private set; }
-
-        public string FRUString { get; private set; }
-
+        private CancellationTokenSource _readCancellationTokenSource;
         private SerialPort _serialPort;
-        private readonly DispatcherTimer _scanTimer = new DispatcherTimer();
-        /*AvalailablePorts = "";
-            ScanString = "";
-            PSUString = "";
-            FRUString = "";
-
-            _serialPort = new SerialPort();*/
-
-
 
         public MainWindow()
         {
@@ -50,9 +47,6 @@ namespace PMBusInterface
             InitializeSerialPort();
             LoadAvailablePorts();
             SetupScanTimer();
-            
-
-            //FindAvailablePorts();
         }
 
         private void InitializeSerialPort()
@@ -64,14 +58,15 @@ namespace PMBusInterface
                 StopBits = StopBits.One,
                 DataBits = 8,
                 Handshake = Handshake.None,
-                ReadTimeout = 500,
-                WriteTimeout = 500
+                ReadTimeout = 4000,
+                WriteTimeout = 4000,
+
             };
 
             _serialPort.DataReceived += SerialPort_DataReceived;
-
         }
-                private void LoadAvailablePorts()
+
+        private void LoadAvailablePorts()
         {
             available_ports.ItemsSource = SerialPort.GetPortNames()
                 .Select(p => new COM_Port { Name = p, Description = GetPortDescription(p) })
@@ -81,51 +76,119 @@ namespace PMBusInterface
                 available_ports.SelectedIndex = 0;
         }
 
+        private async void SerialPort_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            try
+            {
+                // Читаем все доступные данные
+                var bytesToRead = _serialPort.BytesToRead;
+                if (bytesToRead <= 0) return;
+
+                var buffer = new byte[bytesToRead];
+                var bytesRead = _serialPort.Read(buffer, 0, bytesToRead);
+                var data = Encoding.ASCII.GetString(buffer, 0, bytesRead);
+
+                lock (_bufferLock)
+                {
+                    _receiveBuffer.Append(data);
+                }
+
+                _dataReceivedEvent.Set();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Ошибка обработки данных: {ex}");
+                Dispatcher.Invoke(() => addresses.Text += $"Ошибка: {ex.Message}\n");
+            }
+        }
+        
         private void SetupScanTimer()
         {
-            _scanTimer.Interval = TimeSpan.FromMilliseconds(100); // Чаще проверяем
-            _scanTimer.Tick += (s, e) =>
+            _scanTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(500)
+            };
+
+            _scanTimer.Tick += async (s, e) =>
             {
                 if (!_serialPort.IsOpen) return;
 
                 try
                 {
-                    // Чтение всех доступных данных
-                    if (_serialPort.BytesToRead > 0)
+                    string dataToProcess = null;
+
+                    lock (_bufferLock)
                     {
-                        string data = _serialPort.ReadExisting();
-                        Dispatcher.Invoke(() => {
-                            addresses.Text += data;
-                            // Автопрокрутка
-                            var scrollViewer = FindVisualChild<ScrollViewer>(addresses);
-                            scrollViewer?.ScrollToEnd();
-                        });
+                        if (_receiveBuffer.Length > 0)
+                        {
+                            dataToProcess = _receiveBuffer.ToString();
+                            _receiveBuffer.Clear();
+                        }
+                    }
+
+                    if (dataToProcess != null)
+                    {
+                        await ProcessReceivedData(dataToProcess);
                     }
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"Ошибка чтения: {ex}");
-                    _scanTimer.Stop();
+                    Debug.WriteLine($"Ошибка таймера: {ex}");
                 }
             };
         }
 
-        // Вспомогательный метод для поиска ScrollViewer
-        private static T FindVisualChild<T>(DependencyObject obj) where T : DependencyObject
+        private async Task ProcessReceivedData(string data)
         {
-            for (int i = 0; i < VisualTreeHelper.GetChildrenCount(obj); i++)
+            await Dispatcher.InvokeAsync(() =>
             {
-                var child = VisualTreeHelper.GetChild(obj, i);
-                if (child is T result)
-                    return result;
-                var childResult = FindVisualChild<T>(child);
-                if (childResult != null)
-                    return childResult;
-            }
-            return null;
-        }
+                foreach (var line in data.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    if (line.Contains("[PSU_START]"))
+                    {
+                        currentReportType = ReportType.PSU;
+                        currentReportBuffer.Clear();
+                        
+                        continue;
+                    }
+                    else if (line.Contains("[FRU_START]"))
+                    {
+                        currentReportType = ReportType.FRU;
+                        currentReportBuffer.Clear();
+                        
+                        continue;
+                    }
+                    else if (line.Contains("[PSU_END]"))
+                    {
+                        PSUoutput.Text = currentReportBuffer.ToString();
+                        currentReportType = ReportType.None;
+                        continue;
+                    }
+                    else if (line.Contains("[FRU_END]"))
+                    {
+                        FRUoutput.Text = currentReportBuffer.ToString();
+                        currentReportType = ReportType.None;
+                        continue;
+                    }
 
-        private string GetPortDescription(string portName)
+                    switch (currentReportType)
+                    {
+                        case ReportType.PSU:
+                            currentReportBuffer.AppendLine(line);
+                            break;
+                        case ReportType.FRU:
+                            currentReportBuffer.AppendLine(line);
+                            break;
+                        default:
+                            addresses.Text += line + "\n";
+                            break;
+                    }
+                }
+            });
+         }
+
+
+        private static string GetPortDescription(string portName)
         {
             try
             {
@@ -142,32 +205,6 @@ namespace PMBusInterface
             }
         }
 
-        private void SerialPort_DataReceived(object sender, SerialDataReceivedEventArgs e)
-        {
-           /* var data = _serialPort.ReadExisting();
-            Dispatcher.Invoke(() =>
-            {
-                // Здесь будет обработка входящих данных
-                // Например:
-                if (data.Contains("Found device"))
-                {
-                    addresses.Text += data + "\n";
-                }
-            });*/
-        }
-        private void HexInput_PreviewTextInput(object sender, TextCompositionEventArgs e)
-        {
-            // Разрешаем только 0-9, A-F, a-f и x
-            e.Handled = !System.Text.RegularExpressions.Regex.IsMatch(
-                e.Text, @"^[0-9a-fA-Fx]+$");
-
-            // Автоматически добавляем 0x если нужно
-            if (fru_input.Text.Length == 0 && e.Text.ToLower() != "0")
-            {
-                fru_input.Text = "0x";
-                fru_input.CaretIndex = 2;
-            }
-        }
         private void ScanPort(object sender, RoutedEventArgs e)
         {
             if (available_ports.SelectedItem == null)
@@ -176,35 +213,28 @@ namespace PMBusInterface
                 return;
             }
 
-            var port = (COM_Port)available_ports.SelectedItem;
-
             try
             {
-                // Закрыть порт, если открыт
+                var port = (COM_Port)available_ports.SelectedItem;
+
                 if (_serialPort.IsOpen)
                     _serialPort.Close();
 
-                // Настройка и открытие
                 _serialPort.PortName = port.Name;
                 _serialPort.Open();
 
-                // Диагностика
-                Debug.WriteLine($"Порт {port.Name} открыт: {_serialPort.IsOpen}");
                 addresses.Text = "Scanning...\n";
-
-                // Важно: очистить буферы перед отправкой!
                 _serialPort.DiscardInBuffer();
                 _serialPort.DiscardOutBuffer();
 
-                // Отправка команды с переносом строки
-                _serialPort.Write("SCAN\r\n");  // \n или \r\n в зависимости от МК
+                // Отправка команды
+                _serialPort.Write("SCAN\r\n");
 
-                // Запуск таймера для чтения
                 _scanTimer.Start();
             }
             catch (Exception ex)
             {
-                addresses.Text += $"Ошибка: {ex.Message}\n";
+                MessageBox.Show($"Ошибка: {ex.Message}");
                 Debug.WriteLine(ex.ToString());
             }
         }
@@ -213,18 +243,9 @@ namespace PMBusInterface
         {
             LoadAvailablePorts(); // Перезагружаем список портов
         }
-        private void FindAvailablePorts()
-        {
-            // here you should find all available ports
-            available_ports.ItemsSource = new COM_Port[]
-            {
-                new COM_Port {Name = "Port 1"},
-                new COM_Port {Name = "Port 2"},
-            };
-        }
 
-
-        private async void CheckFRU(object sender, RoutedEventArgs e)
+       
+        private void CheckFRU(object sender, RoutedEventArgs e)
         {
             if (!_serialPort.IsOpen)
             {
@@ -232,75 +253,61 @@ namespace PMBusInterface
                 return;
             }
 
-            if (string.IsNullOrWhiteSpace(fru_input.Text) ||
-                !fru_input.Text.StartsWith("0x") ||
-                fru_input.Text.Length < 3)
-            {
-                MessageBox.Show("Введите корректный адрес (например: 0x50)");
-                return;
-            }
-
-            try
-            {
-                // Очистка предыдущих данных
-                FRUoutput.Text = "Запрос данных FRU...\n";
-
-                // Отправка команды
-                string command = $"CHECK_FRU {fru_input.Text}\n";
-                _serialPort.Write(command);
-
-                // Ожидание ответа с таймаутом
-                await WaitForResponseAsync("FRU_DATA", TimeSpan.FromSeconds(3));
-            }
-            catch (Exception ex)
-            {
-                FRUoutput.Text += $"Ошибка: {ex.Message}\n";
-            }
+            FRUoutput.Text = "Ожидание данных FRU...\n";
+            _serialPort.DiscardInBuffer();
+            _serialPort.Write($"CHECK_FRU {fru_input.Text}\r\n");
         }
 
-        private async Task WaitForResponseAsync(string expectedStart, TimeSpan timeout)
-        {
-            DateTime startTime = DateTime.Now;
-            StringBuilder response = new StringBuilder();
-
-            while (DateTime.Now - startTime < timeout)
-            {
-                if (_serialPort.BytesToRead > 0)
-                {
-                    string data = _serialPort.ReadExisting();
-                    response.Append(data);
-
-                    if (response.ToString().Contains(expectedStart))
-                    {
-                        Dispatcher.Invoke(() => {
-                            FRUoutput.Text += data;
-                        });
-                        return;
-                    }
-                }
-                await Task.Delay(100);
-            }
-            throw new TimeoutException("Устройство не ответило");
-        }
 
         private void CheckPSU(object sender, RoutedEventArgs e)
         {
-            // read uint from input field (read addres from text box)
-            // change scan string (PSUString)
-            PSUoutput.Text = psu_input.Text;
+            if (!_serialPort.IsOpen)
+            {
+                MessageBox.Show("Сначала откройте COM-порт!");
+                return;
+            }
+
+            PSUoutput.Text = "Ожидание данных PSU...\n";
+            _serialPort.DiscardInBuffer();
+            _serialPort.Write($"CHECK_PSU {psu_input.Text}\r\n");
         }
 
-        public void ExportToExcel(object sender, RoutedEventArgs e)
+        private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
+        {
+            _scanTimer.Stop();
+
+            if (_serialPort.IsOpen)
+            {
+                _serialPort.Close();
+            }
+
+            _readCancellationTokenSource?.Cancel();
+        }
+
+        private void ExportToExcel(object sender, RoutedEventArgs e)
         {
             try
             {
-                Report_Handler.CreateReport(output_path.Text);
+                var psuData = PSUoutput.Text;
+                var fruData = FRUoutput.Text;
+
+                Report_Handler.CreateReport(
+                    string.IsNullOrEmpty(output_path.Text) ?
+                        Report_Handler.GetDefaultFilePath() :
+                        output_path.Text,
+                    psuData,
+                    fruData
+                );
+
+
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Error - " + ex);
+                MessageBox.Show($"Ошибка при экспорте: {ex.Message}");
             }
         }
+
+
 
         public void ChooseOutputFolder(object sender, RoutedEventArgs e)
         {
@@ -319,11 +326,6 @@ namespace PMBusInterface
         {
             addresses.Text = string.Empty;
         }
-        private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
-        {
-            _scanTimer.Stop();
-            if (_serialPort.IsOpen)
-                _serialPort.Close();
-        }
+
     }
 }
